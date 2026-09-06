@@ -134,6 +134,35 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 ---
 
+# Stage 5b: Automated Orchestration — The Pipeline
+
+**Activities, in order:**
+
+| Activity | Type | Depends on | Base parameters |
+|---|---|---|---|
+| `identify_next_batch` | Notebook | none | `source_name = "flight"` |
+| **If Condition** | If Condition | `identify_next_batch` Succeeded | Expression: `@equals(json(activity('identify_next_batch').output.result.exitValue).has_next_batch, true)` |
+| `create-new-batch` | Notebook (True branch) | none (branch root) | `source_name = "flight"`, `batch_id = @json(activity('identify_next_batch').output.result.exitValue).batch_id` |
+| `ADLS-landing-flight` | Notebook (True branch) | `create-new-batch` Succeeded | `batch_year = @json(activity('identify_next_batch').output.result.exitValue).batch_year`, `batch_id = @json(activity('identify_next_batch').output.result.exitValue).batch_id` |
+| `landing-bronze-flight` | Notebook (True branch) | `ADLS-landing-flight` Succeeded | same `batch_year`/`batch_id` expressions |
+| `bronze-silver-flight` | Notebook (True branch) | `landing-bronze-flight` Succeeded | same `batch_year`/`batch_id` expressions |
+| `silver-gold-origin-airport` | Notebook (True branch) | `bronze-silver-flight` Succeeded | same `batch_year`/`batch_id` expressions |
+| `silver-gold-destination-airport` | Notebook (True branch) | `bronze-silver-flight` Succeeded | same `batch_year`/`batch_id` expressions |
+| `silver-gold-flight` | Notebook (True branch) | `silver-gold-origin-airport` **and** `silver-gold-destination-airport` Succeeded | same `batch_year`/`batch_id` expressions |
+| `complete-batch` | Notebook (True branch) | `silver-gold-flight` Succeeded | `source_name = "flight"`, `batch_id` expression as above |
+
+**False branch:** empty. No pending batch, the run ends without doing anything further.
+
+**No loop construct.** One pipeline run processes exactly one batch; a monthly schedule trigger fires the next run rather than an Until/For Each draining the whole backlog in one go.
+
+**Why:**
+
+- **Every downstream activity reads `batch_id`/`batch_year` off `identify_next_batch`'s own output**, via the same `json(activity('identify_next_batch').output.result.exitValue).<field>` expression, rather than being passed hand to hand. One source of truth for which batch the run is processing, and one place to change if that ever needs to.
+- **Fan out where the DAG genuinely allows it.** Origin and destination airport both only depend on `bronze-silver-flight`, not on each other, so they run in parallel rather than an arbitrary sequence, then fan back into `silver-gold-flight`, which does need both surrogate keys before it can build the fact table.
+- **One batch per run, on a monthly trigger**, matches the actual cadence of the source data and keeps each run's scope, and its control-table footprint, easy to reason about, rather than a loop that tries to process everything pending in one go.
+
+---
+
 
 
 
