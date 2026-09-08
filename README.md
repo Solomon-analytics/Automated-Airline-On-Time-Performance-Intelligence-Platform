@@ -224,7 +224,93 @@ Everything in that table other than the workspace name and the two container/par
 - **Git integration and a branch policy give this a real audit trail.** A change reaches main only through a reviewed pull request, which is what "changes committed and synced from the Fabric UI" is meant to demonstrate, not just that Git is connected.
 - **A scoped RBAC grant on the Prod container**, rather than broad or inherited access, keeps the access control story consistent with the principle of least privilege, worth calling out explicitly rather than leaving implicit.
 
-**Next:** Data Warehouse and analytics objects.
+---
+
+# Stage 9: Data Warehouse and Analytics Objects
+
+## What was built
+
+A Fabric Warehouse, `aeropulse_wh`, sitting on top of the Gold lakehouse and serving the business-facing analytics layer.
+
+**Two schemas:**
+
+| Schema | Contents | Reached by |
+|---|---|---|
+| `dbo` | Five base tables loaded from Gold | The load procedure only |
+| `analytics` | Views, functions, procedures, summary table | Report consumers |
+
+**Base tables:** `dim_date`, `dim_origin_airport`, `dim_destination_airport`, `dim_carrier`, `fact_flight`.
+
+**Analytics objects, and the business question each answers:**
+
+| Object | Type | Business question |
+|---|---|---|
+| `vw_daily_flight_performance` | View | How many flights ran on a given day, what share arrived on time, and which origin airports performed worst |
+| `vw_carrier_monthly_otp` | View | How each carrier is tracking month on month against an 80% on-time target, and how they rank against each other |
+| `vw_route_performance` | View | Which routes are consistently late once volume is taken into account |
+| `vw_cancellation_analysis` | View | What is actually driving cancellations, by carrier, airport and month |
+| `usp_carrier_performance_summary` | Stored procedure | How a given carrier performed over any date range, and whether delay accumulates through the day |
+| `usp_refresh_monthly_summary` | Stored procedure | Rebuilds the pre-aggregated monthly carrier summary for one batch |
+| `usp_load_warehouse_from_gold` | Stored procedure | Reloads every Warehouse table from Gold |
+| `fn_departure_time_band` | Scalar function | Which part of the day a flight departed in |
+| `fn_flights_in_range` | Inline table-valued function | A joinable flight set for a given date range |
+
+## How it was built
+
+**Build scripts, numbered by run order.** The order is not arbitrary: functions must exist before the views and procedures that call them.
+
+| Script | Creates |
+|---|---|
+| `01_create_schema_and_tables.sql` | `analytics` schema, five base tables in `dbo` |
+| `02_create_and_load_stored_proc.sql` | `usp_load_warehouse_from_gold`, then runs it |
+| `03_create_functions.sql` | Both functions |
+| `04_create_views.sql` | Four analytics views |
+| `05_create_summary_table_and_refresh.sql` | `monthly_carrier_summary` and its refresh procedure |
+| `06_create_reporting_stored_proc.sql` | `usp_carrier_performance_summary` |
+
+**Tables are created with explicit DDL** rather than CTAS, and loaded with TRUNCATE and INSERT. `cancellation_code` was added later with `ALTER TABLE` rather than by rebuilding.
+
+**Cross-database loading.** The load procedure reaches the Gold lakehouse by three-part name, `aeropulse_gold_lh.dbo.<table>`. Because that lakehouse carries the same name in both Dev and Prod, the procedure needs no environment-specific variant.
+
+**Refresh runs in two steps, in order**, after the gold notebook in the orchestration pipeline:
+
+1. `usp_load_warehouse_from_gold`, no parameters.
+2. `usp_refresh_monthly_summary`, taking the run's `batch_id`.
+
+Both are Stored procedure activities in the pipeline, with `batch_id` bound to the same expression every other activity uses. The order matters because the summary reads from `fact_flight` in the Warehouse rather than from Gold, so the Warehouse has to be current before the summary is recalculated.
+
+**Testing** covers row counts reconciled between Warehouse and Gold, orphaned surrogate key checks on carrier, origin airport and date, smoke tests on every view and function, and a cancellation consistency check confirming every cancelled flight carries a code and no uncancelled flight does.
+
+## Why
+
+**Answering questions, not exposing tables.** The four views exist because operations, commercial and network planning ask different questions on different cadences, and each needs a shaped answer rather than a fact table to work out for themselves. `vw_cancellation_analysis` is the clearest example: counting cancellations is easy and not very useful, whereas knowing that weather drives one carrier's cancellations while another's are carrier-caused is actionable.
+
+**A view cannot answer an ad hoc question.** Views take no parameters, so "how did this carrier do between these two dates" has to be a stored procedure. Equally, a procedure's result set cannot be joined to, so anything a caller needs to filter further has to be an inline table-valued function. The object type follows from what each one can technically do:
+
+| | Parameters | Joinable | Can write |
+|---|---|---|---|
+| View | No | Yes | No |
+| Stored procedure | Yes | No | Yes |
+| Inline table-valued function | Yes | Yes | No |
+| Scalar function | Yes | In expressions | No |
+
+**Two schemas set up least privilege.** Splitting base tables from consumer-facing objects means the next stage can grant on `analytics` and deny on `dbo`, so consumers reach the data only through governed views and never the raw fact table. Object-level security falls out of the structure rather than being retrofitted onto a flat schema.
+
+**Explicit DDL protects the security model.** CTAS drops and recreates a table on every reload, taking any GRANT, RLS policy or masking rule with it. Defining tables once and reloading their contents means the security objects added in Stage 10 survive every refresh, which is why `cancellation_code` was added by ALTER rather than a rebuild.
+
+**Objects deploy, scripts do not.** Wrapping the load in a stored procedure rather than leaving it as a loose script means it promotes with the Warehouse through the deployment pipeline, so Prod executes it rather than someone pasting SQL into a second environment. The same applies to parameters: a procedure's parameters come from whatever calls it, which is what lets the orchestration pipeline drive the refresh per batch.
+
+**Business logic lives in one layer.** `delay_category`, `is_delayed` and `primary_delay_cause` are derived in the Gold notebook and deliberately not reimplemented here, because the same rule in two places eventually becomes two different rules. The scalar function adds something genuinely new instead, banding departure times, which answers whether delay compounds through the day, a question the model could not otherwise address.
+
+**Where logic sits depends on what it is.** `cancellation_code` is stored as the source records it and decoded in the view, because a four-value lookup on one column is presentation. `primary_delay_cause` is derived upstream because working it out means comparing five columns against each other, which is transformation.
+
+**Join keys are typed to match.** `flight_date_id` is built in Gold as an integer so it matches `dim_date.date_id`, avoiding an implicit conversion on every downstream query. It is a dimensional surrogate key, so building it in the dimensional layer rather than in Silver puts it where it belongs.
+
+**Reloads are idempotent.** The summary refresh clears a batch's rows before reinserting, so re-running it after a corrected batch replaces rather than duplicates. The Warehouse itself is a full reload of current Gold state, which rewrites more than strictly necessary each month but keeps the load logic simple and leaves incremental merge logic in the Lakehouse layer where it already exists. At this volume that trade is worth making.
+
+**Next:** Security, database roles plus RLS, CLS and dynamic data masking over the `analytics` schema.
+
+
 
 
 
