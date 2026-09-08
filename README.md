@@ -198,6 +198,24 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 - Blob Data Storage Contributor role granted on the ADLS Prod container, scoped to what the pipeline actually needs to read there.
 
+**Dev vs Prod, what actually changed:**
+
+| | Dev (`aeropulse-dev`) | Prod (`aeropulse-prod`) |
+|---|---|---|
+| Fabric workspace | `aeropulse-dev` | `aeropulse-prod` |
+| ADLS source container | `flight-data` | `flight-data-prod` |
+| `landing-environment` → `source_adls_account_name` | `aeropulse` | `aeropulse` (unchanged) |
+| `landing-environment` → `source_container_name` | `flight-data` | `flight-data-prod` (parameter rule) |
+| Default lakehouse on landing notebooks | `aeropulse_landing_lh` (Dev) | `aeropulse_landing_lh` (Prod copy, rebound by rule) |
+| Default lakehouse on bronze/silver/gold/control notebooks | respective Dev lakehouses | respective Prod lakehouses (rebound by rule) |
+| `control.batch_control` | Dev's own instance | Prod's own instance, seeded separately |
+| Batches processed | 2, run independently in Dev | 2, run independently in Prod |
+| Git integration | connected to Azure DevOps, main branch | not connected, receives changes only via the deployment pipeline |
+| How it gets changes | direct commits (via PR) from feature branches | only ever via a deployment from Dev, never edited directly |
+| ADLS access | dev-scoped access | Blob Data Storage Contributor, scoped to the Prod container |
+
+Everything in that table other than the workspace name and the two container/parameter values is **code that's identical between the two**, the notebooks and pipeline definition don't fork or duplicate, only the environment-specific bindings differ, and those are set by the deployment rules rather than by hand.
+
 **Why:**
 
 - **Parameterisation over hardcoding.** Fabric's deployment rules can only rebind a notebook's default lakehouse automatically, not arbitrary variables inside it. Turning the ADLS account/container into notebook parameters is what makes them something a deployment rule (or a manual override) can actually target per environment, rather than editing code by hand in every stage.
@@ -207,6 +225,8 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 - **A scoped RBAC grant on the Prod container**, rather than broad or inherited access, keeps the access control story consistent with the principle of least privilege, worth calling out explicitly rather than leaving implicit.
 
 **Next:** Data Warehouse and analytics objects.
+
+
 
 
 
