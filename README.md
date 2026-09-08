@@ -161,6 +161,8 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 - **Fan out where the DAG genuinely allows it.** Origin and destination airport both only depend on `bronze-silver-flight`, not on each other, so they run in parallel rather than an arbitrary sequence, then fan back into `silver-gold-flight`, which does need both surrogate keys before it can build the fact table.
 - **One batch per run, on a monthly trigger**, matches the actual cadence of the source data and keeps each run's scope, and its control-table footprint, easy to reason about, rather than a loop that tries to process everything pending in one go.
 
+**Design note: why airport, carrier, `dim_carrier` and `dim_date` aren't in this pipeline.** All four are full-refresh, source-independent of any batch, and already populated in Gold, so re-running them every month would just be wasted compute
+
 ---
 
 
