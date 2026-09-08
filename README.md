@@ -165,20 +165,48 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 ---
 
+# Stage 8: CI/CD
+
+**Scope decision:** two environments, Dev and Prod. Test was deliberately dropped from the original Dev/Test/Prod plan to save time, this is a scoping choice, not a gap.
+
+**Source control:**
+
+- Azure DevOps project and Git repo created.
+- `aeropulse-dev` connected to it via workspace Git integration, main branch.
+- Branch policy on main: minimum 1 reviewer, no direct commits.
+- CI workflow demonstrated end to end: branched out to a feature workspace, made a change, committed, raised a PR in Azure DevOps, reviewed and approved, merged to main, updated the Dev workspace from source control.
+
+**Environment-specific data sources:**
+
+- `flight-data-prod` container created in the same `aeropulse` storage account, mirroring the Dev container's folder layout.
+- `landing-environment` parameterised: `source_adls_account_name`/`source_container_name` set as a tagged parameters cell, defaulting to Dev's values.
+- Two batches of source files uploaded to `flight-data-prod`.
+
+**Deployment pipeline:**
+
+- `aeropulse-dev-to-prod`, two stages, `aeropulse-dev` assigned to Development and `aeropulse-prod` assigned to Production.
+- All items (four lakehouses, every notebook, the orchestration pipeline) deployed Dev to Prod.
+- Deployment rules set on the Production stage: a **parameter rule** on `landing-environment` pointing `source_container_name` at `flight-data-prod`, and a **default lakehouse rule** on every other notebook, rebinding each to its corresponding lakehouse inside `aeropulse-prod`.
+- Redeployed after setting the rules, since rules only take effect at deployment time.
+
+**Running Prod independently:**
+
+- `00-control-table` run inside `aeropulse-prod` to seed its own `control.batch_control`, separate from Dev's.
+- Orchestration pipeline run in `aeropulse-prod`, processing the two uploaded batches against `flight-data-prod` end to end, landing through to gold.
+
+**Access control:**
+
+- Blob Data Storage Contributor role granted on the ADLS Prod container, scoped to what the pipeline actually needs to read there.
+
+**Why:**
+
+- **Parameterisation over hardcoding.** Fabric's deployment rules can only rebind a notebook's default lakehouse automatically, not arbitrary variables inside it. Turning the ADLS account/container into notebook parameters is what makes them something a deployment rule (or a manual override) can actually target per environment, rather than editing code by hand in every stage.
+- **Deployment rules over manual per-environment edits.** Set once on the Production stage, they reapply automatically on every future deployment, so promoting a change from Dev doesn't mean re-doing the environment-specific rebinding each time.
+- **Deployment moves item definitions, not data.** Prod's lakehouses arrived empty and needed their own control table seeded and their own batches run, this is expected, not a fault, and is exactly why the two batches processed in Prod are a genuine end-to-end proof rather than a copy of Dev's results.
+- **Git integration and a branch policy give this a real audit trail.** A change reaches main only through a reviewed pull request, which is what "changes committed and synced from the Fabric UI" is meant to demonstrate, not just that Git is connected.
+- **A scoped RBAC grant on the Prod container**, rather than broad or inherited access, keeps the access control story consistent with the principle of least privilege, worth calling out explicitly rather than leaving implicit.
+
+**Next:** Data Warehouse and analytics objects.
 
 
 
-
-
-
-
-
-
-
-
-
-
-r or airport reference data
-- Gold layer: star schema (fact_flights plus conformed dimensions), evaluating Lakehouse vs. Warehouse for native RLS/CLS support
-- Orchestration: control-table-driven batch loop, wrapped in a Fabric Data pipeline
-- CI/CD: Git integration on the Dev workspace, deployment pipeline rules for environment-specific lakehouse bindings
