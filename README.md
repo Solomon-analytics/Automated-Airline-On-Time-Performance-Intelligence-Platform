@@ -311,7 +311,75 @@ Both are Stored procedure activities in the pipeline, with `batch_id` bound to t
 
 **Reloads are idempotent.** The summary refresh clears a batch's rows before reinserting, so re-running it after a corrected batch replaces rather than duplicates. The Warehouse itself is a full reload of current Gold state, which rewrites more than strictly necessary each month but keeps the load logic simple and leaves incremental merge logic in the Lakehouse layer where it already exists. At this volume that trade is worth making.
 
+---
+
+# Stage 9b: Promoting the Warehouse to Production
+
+## What was deployed
+
+The Warehouse was built in `aeropulse-dev` and promoted to `aeropulse-prod` through the existing `aeropulse-dev-to-prod` deployment pipeline, making it the first substantial piece of new work carried by that pipeline rather than an initial baseline copy.
+
+The release contained three items:
+
+| Item | State in the comparison view | Why it changed |
+|---|---|---|
+| `aeropulse_wh` | New | Never previously deployed |
+| Gold flight notebook | Different | Added `cancellation_code`, rebuilt `flight_date_id` as an integer |
+| Orchestration pipeline | Different | Added the Warehouse load and summary refresh activities |
+
+**What a Warehouse deployment carries, and what it does not:**
+
+| Carried across | Not carried across |
+|---|---|
+| Schemas (`dbo`, `analytics`) | Table data |
+| Table definitions | Saved query tabs in the SQL editor |
+| Views, functions, stored procedures | Anything authored outside the Warehouse item |
+
+Saved query tabs staying behind is correct rather than a gap. Prod is only ever changed by deployment, so build scripts sitting in the Prod editor would invite exactly the manual change the process is designed to prevent. The only SQL run directly in Prod is the load and refresh calls, and the verification queries.
+
+## How it was deployed
+
+**The Warehouse could not be promoted in a single pass**, because the release changed both a Gold table's schema and the Warehouse that reads it.
+
+When Fabric imports a Warehouse it recreates each object by executing its DDL. Creating `usp_load_warehouse_from_gold` therefore requires resolving every column the procedure references, including `aeropulse_gold_lh.dbo.fact_flight.cancellation_code`. Prod's Gold table existed but did not yet have that column, so the procedure failed to create and the import stopped:
+
+```
+DmsImportDatabaseException ... File: dbo/StoredProcedures/usp_load_warehouse_from_gold.sql,
+Error: Invalid column name 'cancellation_code'.
+```
+
+Deferred name resolution does not help here. It applies when a referenced table is missing entirely, not when the table resolves and one of its columns does not.
+
+The import also does not roll back cleanly. The first attempt left a partially built Warehouse in Prod with the `dbo` objects present and no `analytics` schema, which had to be deleted before a clean redeployment.
+
+**The sequence that worked:**
+
+1. **Deploy everything except the Warehouse.** Notebooks and the orchestration pipeline promoted first, with `aeropulse_wh` deselected.
+2. **Rebuild Prod's Gold** using the newly deployed notebook: drop `fact_flight`, re-run for both batches, and confirm `cancellation_code` is actually present before continuing. Deploying a notebook carries the code, not the data it produces, so this step is a genuine execution rather than a promotion.
+3. **Delete the partial Warehouse** left by the failed attempt.
+4. **Deploy the Warehouse.** The procedure body now resolves and the import completes.
+5. **Populate Prod:** `usp_load_warehouse_from_gold`, then `usp_refresh_monthly_summary` once per loaded batch.
+6. **Verify:** object catalogue checked against the expected set, row counts reconciled against Prod's own Gold, orphan key checks returning zero.
+
+**Verification found `dim_carrier` empty in Prod.** The Warehouse load is a straight mirror of Gold, so an empty target meant an empty source. The cause was upstream: airport and carrier are full-refresh reference sources that had deliberately been left outside the orchestration pipeline and run by hand instead. That worked in Dev, where they had been run, and failed silently in Prod, where they had not. The Gold reference notebooks compounded it by filtering their Silver source on `batch_id`, so a mismatch produced an empty dimension rather than an error.
+
+The fix was to bring the reference chain into the orchestration pipeline so it runs in every environment without depending on anyone remembering.
+
+## Why
+
+**Deployment moves item definitions, not data, and that is the point.** Prod's Warehouse arrived with its full object set and no rows, exactly as Prod's lakehouses did earlier. Each environment then proves itself by loading and running independently, so a green Prod is evidence the solution works there rather than a copy of Dev's results.
+
+**Object dependencies across items create deployment ordering constraints.** A Warehouse procedure that reads a Lakehouse table binds the two items together at deployment time, not just at runtime. Any release that changes a schema on one side and the reader on the other has to be sequenced, which is a normal release-management problem rather than a Fabric quirk, and is why the promotion process is written down rather than improvised.
+
+**Manual steps do not survive promotion.** The empty `dim_carrier` is the clearest evidence in this project for automating everything a pipeline can reasonably own. A step that exists only as something a person remembers to do will hold in the environment where it was done and quietly fail everywhere else. The reference data was small enough that keeping it out of the pipeline saved very little, and the cost of that saving was an entire dimension missing in Production.
+
+**Failures should be loud.** The reference dimension failed silently because a `batch_id` filter on a full-refresh table returns an empty set rather than an error when nothing matches. Removing that filter turns a class of silent emptiness into either correct data or a visible failure, which is the more useful of the two outcomes.
+
+**Production is a destination, never a source.** No object in the Prod Warehouse was created by hand. Everything arrived by deployment, and the only statements executed there are the load, the refresh and the verification queries. That is what makes the Dev to Prod comparison meaningful: the code is identical and only the environment bindings and the data differ.
+
 **Next:** Security, database roles plus RLS, CLS and dynamic data masking over the `analytics` schema.
+
+
 
 
 
