@@ -173,8 +173,9 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 - Azure DevOps project and Git repo created.
 - `aeropulse-dev` connected to it via workspace Git integration, main branch.
-- Branch policy on main: minimum 1 reviewer, no direct commits.
+- Branch policy on main: minimum 1 reviewer, which in Azure DevOps is also what blocks direct pushes, so every change has to arrive through a pull request. Self-approval is permitted, since this is a single-developer project; on a real team that setting would be off and the reviewer would be someone else.
 - CI workflow demonstrated end to end: branched out to a feature workspace, made a change, committed, raised a PR in Azure DevOps, reviewed and approved, merged to main, updated the Dev workspace from source control.
+- The policy has been observed working rather than just configured: an attempted direct commit from `aeropulse-dev` was rejected with `Git_GitProviderCommitRejectedByPolicy`, since a workspace bound to a protected branch cannot commit to it.
 
 **Environment-specific data sources:**
 
@@ -211,7 +212,7 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 | `control.batch_control` | Dev's own instance | Prod's own instance, seeded separately |
 | Batches processed | 2, run independently in Dev | 2, run independently in Prod |
 | Git integration | connected to Azure DevOps, main branch | not connected, receives changes only via the deployment pipeline |
-| How it gets changes | direct commits (via PR) from feature branches | only ever via a deployment from Dev, never edited directly |
+| How it gets changes | pull requests from feature branches, merged into main, then pulled down | only ever via a deployment from Dev, never edited directly |
 | ADLS access | dev-scoped access | Blob Data Storage Contributor, scoped to the Prod container |
 
 Everything in that table other than the workspace name and the two container/parameter values is **code that's identical between the two**, the notebooks and pipeline definition don't fork or duplicate, only the environment-specific bindings differ, and those are set by the deployment rules rather than by hand.
@@ -221,8 +222,10 @@ Everything in that table other than the workspace name and the two container/par
 - **Parameterisation over hardcoding.** Fabric's deployment rules can only rebind a notebook's default lakehouse automatically, not arbitrary variables inside it. Turning the ADLS account/container into notebook parameters is what makes them something a deployment rule (or a manual override) can actually target per environment, rather than editing code by hand in every stage.
 - **Deployment rules over manual per-environment edits.** Set once on the Production stage, they reapply automatically on every future deployment, so promoting a change from Dev doesn't mean re-doing the environment-specific rebinding each time.
 - **Deployment moves item definitions, not data.** Prod's lakehouses arrived empty and needed their own control table seeded and their own batches run, this is expected, not a fault, and is exactly why the two batches processed in Prod are a genuine end-to-end proof rather than a copy of Dev's results.
-- **Git integration and a branch policy give this a real audit trail.** A change reaches main only through a reviewed pull request, which is what "changes committed and synced from the Fabric UI" is meant to demonstrate, not just that Git is connected.
+- **Git integration and a branch policy give this a real audit trail.** A change reaches main only through a pull request, which is what "changes committed and synced from the Fabric UI" is meant to demonstrate, not just that Git is connected. It also means the workspace bound to main is a destination rather than a source: development happens in a feature workspace, and `aeropulse-dev` receives the merged result.
 - **A scoped RBAC grant on the Prod container**, rather than broad or inherited access, keeps the access control story consistent with the principle of least privilege, worth calling out explicitly rather than leaving implicit.
+
+
 
 ---
 
