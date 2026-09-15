@@ -377,7 +377,144 @@ The fix was to bring the reference chain into the orchestration pipeline so it r
 
 **Production is a destination, never a source.** No object in the Prod Warehouse was created by hand. Everything arrived by deployment, and the only statements executed there are the load, the refresh and the verification queries. That is what makes the Dev to Prod comparison meaningful: the code is identical and only the environment bindings and the data differ.
 
-**Next:** Security, database roles plus RLS, CLS and dynamic data masking over the `analytics` schema.
+---
+
+# Stage 10: Security and Access Control
+
+## What was built
+
+Two test identities in Microsoft Entra ID, created with no directory role and no Azure RBAC, so that every permission they hold is one granted deliberately in Fabric or in T-SQL:
+
+| User | Purpose |
+|---|---|
+| `aeropulse-bi-analyst` | Analyst persona used to test item sharing, workspace roles and granular SQL security |
+| `aeropulse-operation-analyst` | Second identity for comparison testing |
+
+Access was then exercised at every layer Fabric exposes, from tenant down to individual column and row.
+
+**Administrative layers:**
+
+| Layer | Scope | What it does not grant |
+|---|---|---|
+| Fabric Administrator | Tenant-wide. Automatically carries domain and capacity admin rights, and can self-elevate to any Fabric role | Workspace access is not automatic |
+| Capacity Administrator | One compute resource. Controls which workspaces use the capacity and its workload settings | No domain rights, no workspace access |
+| Domain Administrator | One domain. Administrative tasks within it | Cannot administer other domains, cannot add or remove domain admins, no workspace access without a separate role |
+| Domain Contributor | Can add workspaces to a domain | Almost nothing else |
+
+Fabric Administrator is assigned as an Entra ID directory role. Capacity Administrator is assigned either in the Fabric admin portal or on the capacity resource in Azure.
+
+**Workspace roles, observed behaviour:**
+
+| Role | What the user could actually do |
+|---|---|
+| Viewer | Read notebooks and pipeline activities. Could not view lakehouse tables or files |
+| Contributor | Query the SQL endpoint, run notebooks, read tables and files, run the orchestration pipeline. Could not add other users |
+| Member | Everything Contributor can do, plus adding other users |
+
+**Item-level sharing on the gold lakehouse:**
+
+| Permission | Effect |
+|---|---|
+| Share with no additions | Opens the lakehouse and SQL endpoint, connects via SSMS, reads the default semantic model. No file access. Granular SQL security then layers on top |
+| Read all SQL endpoint data | Read on everything exposed through the T-SQL endpoint, equivalent to `db_datareader` |
+| Read all Apache Spark and subscribe to events | Reads delta tables through Spark notebooks, grants raw file access, enables event subscriptions and shortcuts |
+| Execute Apache Spark jobs | Does not enable querying. Appears to exist for scheduling jobs rather than reading data |
+
+**Granular security, implemented and tested in a Warehouse:**
+
+- **Object-level security** on schemas and tables, using `GRANT`, `DENY` and `REVOKE`.
+- **Column-level security**, granting `SELECT` on a named column list so that a sensitive column is excluded.
+- **Row-level security**, using a predicate function and a security policy to restrict a user to their own region.
+- **Dynamic data masking**, using all four masking functions: `default()`, `email()`, `random()` and `partial()`.
+
+## How it was built
+
+**Object-level security.** Grant on the schema, or on individual tables where access should be narrower:
+
+```sql
+GRANT SELECT ON SCHEMA::<schema> TO [user];
+GRANT SELECT ON <schema>.<table> TO [user];
+DENY  SELECT ON <schema>.<table> TO [user];
+REVOKE SELECT ON <schema>.<table> TO [user];
+```
+
+Sharing the Warehouse with no additional item permissions left the user unable to read any table. Access appeared only as each `GRANT` was issued.
+
+**Column-level security.** Same statements, scoped to a column list:
+
+```sql
+GRANT SELECT ON <schema>.employees (emp_id, full_name, department) TO [user];
+```
+
+`salary` was deliberately omitted. Querying it returned:
+
+```
+Msg 230: The SELECT permission was denied on the column 'salary' of the object 'employees'
+```
+
+`REVOKE` on `department` then produced the same error for that column, confirming that revoking clears a permission rather than granting or denying one: the column returned to its default state, which is no access.
+
+**Row-level security.** A predicate function matched against the signed-in user, then a security policy binding it to the table:
+
+```sql
+CREATE FUNCTION access_management.fn_sales_rls(@region VARCHAR(50))
+RETURNS TABLE
+WITH SCHEMABINDING
+AS
+RETURN SELECT 1 AS result
+WHERE @region IN (
+    SELECT region FROM access_management.user_region
+    WHERE user_email = USER_NAME()
+);
+GO
+
+CREATE SECURITY POLICY access_management.sales_rls_policy
+ADD FILTER PREDICATE access_management.fn_sales_rls(region)
+ON access_management.sales
+WITH (STATE = ON);
+```
+
+The mapping table tied the analyst to the north region. Querying `sales` as that user returned only north rows, with no filter in the query itself.
+
+**Dynamic data masking.** Applied at table creation, then altered and dropped to test each operation:
+
+```sql
+-- at creation
+email_address     VARCHAR(100) MASKED WITH (FUNCTION = 'email()'),
+credit_card_number VARCHAR(20) MASKED WITH (FUNCTION = 'partial(0,"XXXX-XXXX-XXXX-",4)'),
+random_number      INT         MASKED WITH (FUNCTION = 'random(1000, 9999)'),
+salary             DECIMAL(10,2) MASKED WITH (FUNCTION = 'default()')
+
+-- add, remove, and override
+ALTER TABLE <schema>.<table> ALTER COLUMN <col> ADD MASKED WITH (FUNCTION = 'default()');
+ALTER TABLE <schema>.<table> ALTER COLUMN <col> DROP MASKED;
+GRANT  UNMASK ON <schema>.<table> TO [user];
+REVOKE UNMASK ON <schema>.<table> TO [user];
+```
+
+**Testing method.** Every permission was verified by signing in as the test user and running the same query, rather than by inspecting the configuration. The admin account sees unmasked values throughout, so masking can only be confirmed from a non-privileged session. The `random()` function returned a different value on each execution, which is visible across repeated runs.
+
+## Why
+
+**Least privilege is the organising principle.** Both test users were created with no Entra directory role and no Azure RBAC, so nothing is inherited and every capability they have was granted on purpose. That makes the access model auditable: the answer to "why can this user see this" is always a specific grant, never an accident of inheritance. It also limits the blast radius if an account is compromised, and keeps role reviews meaningful.
+
+**The layers are independent, and that is what makes testing meaningful.** A workspace role and an item share are alternative routes to the same data, not a sequence. Granting a workspace role of Contributor or above effectively bypasses granular SQL security, because workspace access to a Warehouse carries full read. Testing RLS or masking against such a user proves nothing. Everything here was therefore tested against a user with no workspace role at all.
+
+**Grant upwards rather than deny downwards.** Sharing an item without additional permissions, then granting specific access in T-SQL, produces an access model that is easy to read and easy to reason about. Starting from broad access and carving exceptions with `DENY` gets harder to audit with every exception, and mixes two mechanisms so it stops being obvious which one is deciding the outcome.
+
+**Separating `dbo` from `analytics` in the Warehouse exists precisely for this.** Base tables in one schema, consumer-facing views in another, so access can be granted on the governed layer and withheld from the raw fact table. Object-level security falls out of the structure rather than being retrofitted onto a flat schema.
+
+**Masking is not a security boundary.** It prevents accidental exposure, not determined access. A user who can query a table can often infer or reconstruct masked values, and anyone with a privileged workspace role sees through it entirely. It belongs on top of object, column and row security, never instead of them.
+
+**Row-level security belongs in the database, not the query.** Putting the predicate in a security policy means the restriction holds no matter how the user reaches the data: a SQL client, a notebook, a report. Filtering in a view or a report can always be worked around by querying the underlying table directly.
+
+**Governance sits alongside access, not inside it.** Endorsement (promoted, certified, master data), tagging and sensitivity labels do not grant or restrict access. They tell people what an item is and how far it can be trusted, which is a different problem from who may read it. Certification is restricted to reviewers a Fabric administrator nominates, precisely so that "certified" keeps meaning something.
+
+
+
+
+
+
 
 
 
