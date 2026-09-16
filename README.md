@@ -1,35 +1,79 @@
-# Automated-Airline-On-Time-Performance-Intelligence-Platform
-Airlines, airports and travel platforms need current, trustworthy visibility into flight reliability to make route, compensation and capacity decisions. Source data arrives monthly, raw and inconsistent (missing delay-cause codes, cancelled vs diverted flights, shifting airport/carrier reference data). Manual reprocessing doesn't scale, and silent failures erode trust in the numbers.
-
 # Aeropulse
 
-A Microsoft Fabric build covering DP-700 Domain 1 (Implement and Manage an Analytics Solution) and Domain 3 (Monitor and Optimize), using US Bureau of Transportation Statistics (BTS) flight data.
+Airline on-time performance, from raw monthly CSV files to a governed reporting layer, built on Microsoft Fabric.
 
-Part of a two-project portfolio series:
+Source data is US Bureau of Transportation Statistics flight records. It arrives monthly, messy, and inconsistent: missing delay-cause codes, cancelled flights that still carry departure times, airport and carrier reference data that shifts underneath you. Reprocessing it by hand does not scale, and silent failures are worse than loud ones because people keep trusting numbers that have quietly stopped being right.
 
-- **Project 1** ("Aeropulse: ADLS to Gold"): a single working Fabric workspace, medallion architecture, dimensional model.
-- **Project 2** (this repository): taking that solution from a single workspace to something that could plausibly run in a team, with environment separation, access control, CI/CD, orchestration and operational visibility.
+This repository is the second of two projects. [Project 1](#project-1) built a working medallion pipeline in one workspace. This one takes it to something that could run in a team: separate environments, access control, CI/CD, orchestration and monitoring.
 
-## What this project sets out to do
-
-| # | Stage | What it covers |
-|---|-------|-----------------|
-| 1 | Project environment setup | Create the Azure tenant account, grant Fabric access (licence/capacity) and storage access (ADLS Gen2), create and configure the Fabric workspace |
-| 2 | Data ingestion | Raw source files into the Landing layer, parameterised by batch |
-| 3 | Data transformation (medallion architecture) | Landing to Bronze to Silver: schema enforcement, cleaning, casting, deduplication, data quality flags |
-| 4 | Reporting and analytics | Silver to Gold, dimensional model (star schema: fact plus dimensions), feeding a semantic model |
-| 5 | Automated orchestration | Control table plus pipeline automation, replacing the manual run-by-hand chain |
-| 6 | Monitoring | Monitoring Hub, pipeline run history |
-| 7 | Alerting | Data Activator alert on pipeline failure (or a threshold breach) |
-| 8 | CI/CD | Dev/Test/Prod workspaces, Git integration, deployment pipeline with environment-specific deployment rules |
-| 9 | Data warehouse objects | Analytics views, stored procedures and functions in the Warehouse, answering specific business questions, promoted Dev to Prod via the CI/CD pipeline |
-| 10 | Security | OLS, RLS, CLS and data masking, layered onto the warehouse objects, with environment-specific rules handled as deployment parameters |
-| 11 | Testing | Reconciliation and validation checks that fail a batch on a data correctness issue, not just a technical exception |
-| 12 | Data dictionary | Full documentation of every gold and warehouse table, column and business rule |
+![Aeropulse architecture](docs/images/architecture-overview.png)
 
 ---
 
-# Stage 1: Project Environment Setup
+## Contents
+
+- [What this shows](#what-this-shows)
+- [Stack](#stack)
+- [How the data flows](#how-the-data-flows)
+- [Build stages](#build-stages)
+  - [1. Environment setup](#1-environment-setup)
+  - [2. Ingestion](#2-ingestion)
+  - [3. Bronze](#3-bronze)
+  - [4. Silver](#4-silver)
+  - [5. Gold](#5-gold)
+  - [6. Orchestration](#6-orchestration)
+  - [7. CI/CD and Deployment Pipeline](#7-cicd)
+  - [8. Warehouse and analytics](#8-warehouse-and-analytics)
+  - [9. Security & Access Management](#9-security)
+- [Two things that went wrong](#two-things-that-went-wrong)
+- [Decisions worth explaining](#decisions-worth-explaining)
+- [Repository layout](#repository-layout)
+- [Screenshots](#screenshots)
+- [Project 1](#project-1)
+
+---
+
+## What this shows
+
+| Area | Evidence in this repo |
+|---|---|
+| Medallion architecture | Landing, Bronze, Silver, Gold as four lakehouses with distinct rules at each hop |
+| Dimensional modelling | Star schema, role-playing dimensions resolved at build time, generated date dimension |
+| Incremental processing | Batch-partitioned flight loads that are safe to re-run |
+| Data quality | Profiling before rules, quality flags rather than silent drops |
+| Orchestration | Control table state machine, parameterised pipeline, parallel fan-out |
+| CI/CD & Deployment Pipeline | Git integration, branch policy, deployment pipeline with environment rules |
+| SQL engineering | Views, stored procedures, scalar and table-valued functions, chosen deliberately |
+| Security &  Access Management | Object, column and row-level security, plus dynamic data masking, tested as a real non-admin user |
+| Operations | Monitoring, failure alerting, reconciliation tests that fail on bad data rather than only on exceptions |
+
+## Stack
+
+Microsoft Fabric (Lakehouse, Warehouse, Data Factory pipelines, Data Activator), PySpark, T-SQL, Delta Lake, Azure Data Lake Storage Gen2, Azure DevOps, Power BI.
+
+---
+
+## How the data flows
+
+![Medallion layers](docs/images/architecture-medallion.png)
+
+**Landing** holds the raw file exactly as it arrived, with three columns stamped on for lineage: `batch_id`, `ingested_timestamp`, `source_path`. Nothing is cleaned or cast here. Any row can be traced back to the run and file that produced it, and the original can always be replayed if a downstream rule turns out to be wrong.
+
+**Bronze** enforces an explicit schema with `FAILFAST`, so a malformed row is caught at the door rather than poisoning Silver. Everything is read as a string on purpose. Casting happens one layer later, once the value has been validated, so nothing gets nulled out by a cast that fired too early.
+
+**Silver** is where the cleaning lives: renaming, trimming, casting, deduplication, surrogate keys, data quality flags. Writes are a batch-guarded merge, so a corrected batch can update existing rows but an out-of-order older batch cannot overwrite newer data.
+
+**Gold** is the star schema: `fact_flight` joined out to date, carrier, origin airport and destination airport. Reporting logic such as `is_delayed` and `delay_category` is derived once here so every consumer gets the same answer.
+
+**Warehouse** sits on top of Gold and serves the business-facing layer through views, procedures and functions, with security applied.
+
+---
+
+## Build stages
+
+<a id="1-environment-setup"></a>
+<details>
+<summary><b>1. Environment setup</b></summary>
 
 - **Microsoft Entra ID**: created a dedicated project user, granted Owner and a Fabric role.
 - **Resource group**: created to hold Fabric and any other Azure resources for this project.
@@ -41,62 +85,69 @@ Part of a two-project portfolio series:
   - `aeropulse_silver_lh`
   - `aeropulse_gold_lh`
 
----
+![Workspace setup](docs/images/01-workspace-lakehouses.png)
 
-# Stage 2: Data Ingestion (ADLS to Landing)
+</details>
 
-- **`landing-environment`**: shared config notebook, holds the ADLS account/container and source paths for airport, carrier and flight. Flight path is built dynamically from `batch_year`/`batch_id`, so it always resolves to the right month's file.
-- **`landing-helper`**: defines `write_to_landing()`, the one write function all three ingestion notebooks call. Tags every row with `batch_id`, `ingested_timestamp` and `source_path` for lineage. No transformation happens here, raw CSV in, raw CSV out.
-- **Load type per source**:
-  - `airport-landing` and `carrier-landing`: **full load**, small reference tables, entire dataset overwritten on every run.
-  - `flight-landing`: **incremental**, one month per run, written into its own `batch_id`-named subfolder so re-running a batch never touches another batch's data.
+<a id="2-ingestion"></a>
+<details>
+<summary><b>2. Ingestion</b></summary>
 
-**Why:**
+Three sources, two load patterns.
 
-- **`landing-environment`** separates configuration from logic, a standard data engineering practice. Paths and account names live in one place, not copied into three notebooks, so an environment change (e.g. moving to a Test/Prod ADLS account later) is a one-line edit, not a find-and-replace across the codebase.
-- **`landing-helper`** centralises the write logic into one reusable, tested function instead of three near-identical copies. This is the DRY principle in practice: one place to fix a bug, one place to add a feature, and every notebook that calls it behaves consistently. Stamping `batch_id`, `ingested_timestamp` and `source_path` on every row also builds lineage in from the start, so any row in Landing can be traced back to exactly which run and file produced it, a basic auditability requirement in any production pipeline.
-- Reference data is small and changes rarely, so a full refresh is simpler and cheap. Flight data is the actual fact source and grows every month, so it's processed incrementally and isolated by batch, which also means a failed or re-run batch can't corrupt another batch's data.
-- Landing does no cleaning or casting by design. Keeping the raw copy untouched and auditable, and pushing all transformation downstream to Bronze/Silver, is standard medallion practice: it means the original source can always be replayed if a transformation rule turns out to be wrong.
+Airport and carrier are small reference tables, so they are fully refreshed on every run. Flight is the fact source and grows monthly, so it loads one month per run into its own `batch_id` folder. Re-running a batch cannot touch another batch's data.
 
----
+Two shared notebooks do the heavy lifting. `landing-environment` holds paths and account names in one place, so moving to a different storage account later is a one-line change rather than a hunt through three notebooks. `landing-helper` holds the single write function all three ingestion notebooks call, which means one place to fix a bug and one place to add a feature.
 
-# Stage 3a: Data Transformation — Bronze (Landing to Bronze)
+![Landing layer](docs/images/02-landing-notebooks.png)
+
+</details>
+
+<a id="3-bronze"></a>
+<details>
+<summary><b>3. Bronze</b></summary>
+
+Same config and helper split as Landing, carried through deliberately so every layer behaves the same way.
+
+The incremental flight load uses `replaceWhere` with `partitionBy` on `batch_id`. Re-running a failed batch replaces only that batch's partition. That makes reprocessing safe and cheap rather than a full table rewrite.
 
 - **`bronze-environment`**: shared config, holds the landing lakehouse path and the per-source landing folder locations that every bronze notebook reads from.
 - **`bronze-helper`**: defines `write_to_bronze()`, the one write function used by all three notebooks. Writes as a managed Delta table with `mergeSchema` enabled. Full load overwrites the whole table; incremental uses `replaceWhere` plus `partitionBy` on `batch_id`, so re-running a batch only replaces that batch's own rows.
 - **`airport-landing-to-bronze`** and **`carrier-landing-to-bronze`**: explicit schema enforced on read, `FAILFAST` on any non-conforming row, full load into `bronze_airport` / `bronze_carrier`.
 - **`flight-landing-to-bronze`**: same explicit-schema-plus-`FAILFAST` pattern, every column read as a string, incremental load into `bronze_flight` for the current `batch_id` only.
 
-**Why:**
+![Bronze tables](docs/images/03-bronze-tables.png)
 
-- **Config/logic separation and a single reusable write function**, the same DRY and single-source-of-truth reasoning as the landing layer, kept consistent through every layer of the pipeline.
-- **Explicit schema plus `FAILFAST`** is a fail-fast control: a malformed or unexpected row is caught the moment it enters Bronze, not silently let through to poison Silver or Gold. It also means the schema is documented in code, not inferred and guessed at.
-- **Every column typed as a string at this layer** is deliberate. Real type casting is deferred to Silver, so a source value that doesn't convert cleanly never gets lost or nulled out by an over-eager cast happening too early, the raw value is preserved until it's actually validated.
-- **`replaceWhere` plus `partitionBy` on `batch_id`** makes the incremental flight load idempotent: re-running a failed or corrected batch replaces only that batch's partition, not the whole table, which is both safer and cheaper than a full overwrite.
-- **Full load for airport/carrier** is proportionate to their size, they're small reference tables, so the simplicity of a full overwrite outweighs any benefit of incremental handling.
+</details>
 
----
+<a id="4-silver"></a>
+<details>
+<summary><b>4. Silver</b></summary>
 
-# Stage 3b: Data Transformation — Silver (Bronze to Silver)
+- **`silver-transformation-exploration`**: Before writing a single cleaning rule, I profiled the data: row counts, null checks, grain uniqueness, how cancelled and diverted are actually encoded, and how big each inconsistency really was. That found 345 cancelled flights still carrying a departure or arrival time. Every rule in the production notebooks traces back to something measured in that profiling notebook rather than something assumed.
 
-- **`silver-transformation-exploration`**: scratch profiling notebook, not part of the production run. Used to actually check the data before writing any rule: row counts, null checks, grain uniqueness, how `CANCELLED`/`DIVERTED` are encoded (1/0), and quantified real inconsistencies (345 cancelled flights still carrying a departure or arrival time). Every decision in the three production notebooks traces back to a finding here.
+Those 345 rows are flagged, not deleted. A cancelled flight with a departure time is a real data quality problem, and dropping it hides the problem instead of surfacing it. Downstream consumers can then decide what to do with it.
+
 - **`silver-environment`**: shared config, holds the bronze lakehouse path and per-source table paths.
 - **`silver-helper`**: shared, dataset-agnostic functions used by all three notebooks: `remove_duplicates`, `remove_nulls`, `rename_column`, `trim_whitespaces`, `cast_columns`, `add_sk_key` (SHA-256 surrogate key), `add_dq_flag`, and `write_to_silver` (creates the schema/table if needed, otherwise merges, guarded so only a row from an equal-or-newer batch can overwrite an existing one).
 - **`airport-bronze-to-silver`**: full refresh. Renames columns, splits `airport_description` into `airport_name` / `airport_city` / `airport_state`, drops null/duplicate `airport_code`, adds `airport_sk`, merges into `silver.airport`.
 - **`carrier-bronze-to-silver`**: full refresh. Renames columns, drops null/duplicate `carrier_code`, adds `carrier_sk`, merges into `silver.carrier`.
 - **`flight-bronze-to-silver`**: incremental, current `batch_id` only. Renames to descriptive column names, casts delay/time/numeric columns, parses `flight_date` (source format confirmed as `M/d/yyyy h:mm:ss a`), derives `is_cancelled`/`is_diverted` booleans and `flight_date_id`, applies two data quality flags for cancellation consistency, deduplicates on the flight grain, adds `flight_sk`, merges into `silver.flight`.
 
-**Why:**
+Surrogate keys are generated here using SHA-256, so Gold joins on a stable key rather than a natural key whose format or meaning might change at the source.
 
-- **Profiling before ruling**, the exploration notebook's job was to quantify the data before any cleaning rule was written, confirming the join grain, the boolean encoding, and the real scale of each inconsistency, rather than assuming them. This is standard data quality practice: understand the data before you write rules to fix it.
-- **Shared helper functions** keep the mechanics (rename, trim, cast, dedupe, surrogate key, data quality flag, merge-write) in one place, so all three notebooks behave consistently and a fix or improvement only needs making once, the same DRY principle carried through from Landing and Bronze.
-- **Merge instead of overwrite**, and specifically a batch-guarded merge (`s.batch_id >= t.batch_id`), makes Silver safe to reprocess: a late or corrected batch updates existing rows, but an out-of-order older batch can't clobber newer data.
-- **Surrogate keys generated here, not later**, is standard dimensional modelling practice. Gold then always joins on a stable, deterministic key rather than a natural key that could change format or meaning at the source.
-- **Data Quality issues are flagged, not silently dropped.** A cancelled flight with a departure time, for example, is kept and marked, so downstream consumers can decide how to treat it rather than losing visibility of a real data quality problem.
 
----
+![Silver profiling](docs/images/04-silver-profiling.png)
 
-# Stage 3c: Data Transformation — Gold (Silver to Gold)
+</details>
+
+<a id="5-gold"></a>
+<details>
+<summary><b>5. Gold</b></summary>
+
+A star schema: one narrow fact table of keys and measures, joined out to conformed dimensions. That is the shape Power BI is built to aggregate efficiently.
+
+Origin and destination are built as two separate dimensions rather than one airport dimension joined twice.
 
 - **`gold-environment`**: shared config, holds the silver source paths and the gold dimension paths `fact-flight` reads back once the dimensions exist.
 - **`gold-helper`**: `add_sk_key` (SHA-256 surrogate key) and `write_to_gold` (create-or-merge write, stamping `created_timestamp`/`updated_timestamp`).
@@ -106,16 +157,17 @@ Part of a two-project portfolio series:
 - **`dim_carrier`**: from silver `carrier`, lineage columns (`batch_id`, `ingested_timestamp`, `source_path`) dropped, they don't belong in a reporting-facing dimension.
 - **`fact_flight`**: joins the current batch of silver `flight` to the three gold dimensions for their surrogate keys, then derives the reporting measures: `total_delay_minutes` (null-safe sum of the five delay-cause columns), `primary_delay_cause`, `is_delayed` (arrival delay ≥ 15 minutes, the standard FAA/BTS definition), `delay_category` (bucketed severity), `flight_status`, and `route`.
 
-**Why:**
+![Star schema](docs/images/05-star-schema.png)
 
-- **Star schema over a flat table** is the standard shape for a reporting/semantic model: a narrow fact table of measures and keys, joined out to conformed dimensions, which is what Power BI (and any BI tool) is built to aggregate and slice efficiently.
-- **Origin and destination handled as two separate dimensions**, built differently, rather than one shared airport dimension joined twice, resolves the role-playing dimension problem at build time instead of pushing two aliased joins onto every downstream report.
-- **A generated, source-independent date dimension** is standard dimensional modelling practice: calendar attributes (year, quarter, weekday name, weekend flag) shouldn't depend on which transactional source happens to be loaded, and building the full range once avoids re-running this every batch.
-- **Business logic derived once, in the fact table**, not left to be recalculated in DAX or SQL by every report. `is_delayed`, `delay_category` and `primary_delay_cause` are computed a single way here, so every consumer of `fact_flight` gets the same answer to "was this flight delayed" without re-implementing the rule.
-- **The fact table only carries keys, not descriptive attributes**, from the dimensions, keeping it normalised and the join pattern predictable, another core star schema principle.
+</details>
 
----
-# Stage 5a: Automated Orchestration — Control Notebooks
+<a id="6-orchestration"></a>
+<details>
+<summary><b>6. Orchestration</b></summary>
+
+A `batch_control` table holds one row per unit of work, moving through an explicit state machine: `PENDING`, `IN_PROGRESS`, then `COMPLETED` or `FAILED`.
+
+The point of this is that batch state lives in SQL rather than only inside Fabric's monitoring UI. Whether a batch succeeded, is still running, or failed and why is a query anyone can run, report on or alert from. Reprocessing a batch is as simple as resetting its row to `PENDING`.
 
 - **`00 control-table`**: creates the `control` schema and `batch_control` table, seeds it with every expected `flight` batch as `PENDING`. Safe to re-run, a left-anti join against what's already tracked stops it duplicating rows or resetting a batch already in progress.
 - **`01 identify-next-batch`**: finds the oldest `PENDING` batch for a source and hands it back to the pipeline as `has_next_batch` / `batch_id` / `batch_year`, via `mssparkutils.notebook.exit`.
@@ -123,18 +175,11 @@ Part of a two-project portfolio series:
 - **`03 complete-batch`**: marks a batch `COMPLETED` and stamps its end time, wired to the success path of the last transform activity.
 - **`04 fail-batch`**: marks a batch `FAILED`, records the error message (escaped and length-capped) and increments `retry_count`, wired to the failure path of any transform activity.
 
+The pipeline itself processes one batch per run on a monthly trigger, matching the cadence of the source. Origin and destination airport run in parallel because neither depends on the other, then fan back in to the fact table, which needs both sets of surrogate keys.
+
 Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-batch) as pipeline-injected parameters, with defaults only used for standalone testing.
 
-**Why:**
-
-- **A control table is a well established orchestration pattern**: one row per unit of work, moving through an explicit state machine (`PENDING` → `IN_PROGRESS` → `COMPLETED`/`FAILED`), rather than relying solely on the pipeline engine's own run history to know what happened.
-- **It decouples batch state from the orchestration tool.** Whether a batch succeeded, is still running, or failed and why is a plain SQL query against `batch_control`, not something that only exists inside Fabric's own monitoring UI, so it can be queried, reported on, or alerted on independently.
-- **Explicit state, not implicit success/failure**, gives a genuine audit trail and a retry mechanism for free: reprocessing a batch is as simple as resetting its row back to `PENDING`.
-- **Splitting the four actions into their own notebooks** (rather than one notebook branching internally) keeps each one single-purpose and lets the pipeline wire success and failure paths to the right one directly, rather than adding conditional logic inside the notebook itself.
-
----
-
-# Stage 5b: Automated Orchestration — The Pipeline
+# 6b: Automated Orchestration — The Pipeline
 
 **Activities, in order:**
 
@@ -155,33 +200,25 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 **No loop construct.** One pipeline run processes exactly one batch; a monthly schedule trigger fires the next run rather than an Until/For Each draining the whole backlog in one go.
 
-**Why:**
+![Orchestration pipeline](docs/images/06-pipeline-dag.png)
+![Control table](docs/images/06-control-table.png)
 
-- **Every downstream activity reads `batch_id`/`batch_year` off `identify_next_batch`'s own output**, via the same `json(activity('identify_next_batch').output.result.exitValue).<field>` expression, rather than being passed hand to hand. One source of truth for which batch the run is processing, and one place to change if that ever needs to.
-- **Fan out where the DAG genuinely allows it.** Origin and destination airport both only depend on `bronze-silver-flight`, not on each other, so they run in parallel rather than an arbitrary sequence, then fan back into `silver-gold-flight`, which does need both surrogate keys before it can build the fact table.
-- **One batch per run, on a monthly trigger**, matches the actual cadence of the source data and keeps each run's scope, and its control-table footprint, easy to reason about, rather than a loop that tries to process everything pending in one go.
+</details>
 
-**Design note: why airport, carrier, `dim_carrier` and `dim_date` aren't in this pipeline.** All four are full-refresh, source-independent of any batch, and already populated in Gold, so re-running them every month would just be wasted compute
+<a id="7-cicd & deployment pipeline"></a>
+<details>
+<summary><b>7. CI/CD & deployment pipeline</b></summary>
 
----
+Two environments, Dev and Prod. Test was dropped to keep the scope sensible, which was a choice rather than an oversight.
 
-# Stage 8: CI/CD
+`aeropulse-dev` is connected to Azure DevOps with a branch policy on main requiring one reviewer, which is also what blocks direct pushes. Every change has to arrive through a pull request. The policy is proven rather than just configured: an attempted direct commit from the workspace was rejected with `Git_GitProviderCommitRejectedByPolicy`.
 
-**Scope decision:** two environments, Dev and Prod. Test was deliberately dropped from the original Dev/Test/Prod plan to save time, this is a scoping choice, not a gap.
+Promotion runs through a deployment pipeline with rules set on the Production stage. A parameter rule points the ADLS container at `flight-data-prod`, and default lakehouse rules rebind every notebook to its Prod counterpart. The notebooks and pipeline definitions are byte-identical between environments. Only the bindings differ, and those are set by rules rather than by hand.
 
-**Source control:**
+Prod then seeds its own control table and runs its own batches. Deployment carries item definitions, not data, so a green Prod is real evidence the solution works there rather than a copy of Dev's results.
 
-- Azure DevOps project and Git repo created.
-- `aeropulse-dev` connected to it via workspace Git integration, main branch.
-- Branch policy on main: minimum 1 reviewer, which in Azure DevOps is also what blocks direct pushes, so every change has to arrive through a pull request. Self-approval is permitted, since this is a single-developer project; on a real team that setting would be off and the reviewer would be someone else.
-- CI workflow demonstrated end to end: branched out to a feature workspace, made a change, committed, raised a PR in Azure DevOps, reviewed and approved, merged to main, updated the Dev workspace from source control.
-- The policy has been observed working rather than just configured: an attempted direct commit from `aeropulse-dev` was rejected with `Git_GitProviderCommitRejectedByPolicy`, since a workspace bound to a protected branch cannot commit to it.
-
-**Environment-specific data sources:**
-
-- `flight-data-prod` container created in the same `aeropulse` storage account, mirroring the Dev container's folder layout.
-- `landing-environment` parameterised: `source_adls_account_name`/`source_container_name` set as a tagged parameters cell, defaulting to Dev's values.
-- Two batches of source files uploaded to `flight-data-prod`.
+![Deployment pipeline](docs/images/07-deployment-pipeline.png)
+![Branch policy](docs/images/07-branch-policy.png)
 
 **Deployment pipeline:**
 
@@ -217,19 +254,11 @@ Each notebook takes its `source_name`/`batch_id` (and `error_message` for fail-b
 
 Everything in that table other than the workspace name and the two container/parameter values is **code that's identical between the two**, the notebooks and pipeline definition don't fork or duplicate, only the environment-specific bindings differ, and those are set by the deployment rules rather than by hand.
 
-**Why:**
+</details>
 
-- **Parameterisation over hardcoding.** Fabric's deployment rules can only rebind a notebook's default lakehouse automatically, not arbitrary variables inside it. Turning the ADLS account/container into notebook parameters is what makes them something a deployment rule (or a manual override) can actually target per environment, rather than editing code by hand in every stage.
-- **Deployment rules over manual per-environment edits.** Set once on the Production stage, they reapply automatically on every future deployment, so promoting a change from Dev doesn't mean re-doing the environment-specific rebinding each time.
-- **Deployment moves item definitions, not data.** Prod's lakehouses arrived empty and needed their own control table seeded and their own batches run, this is expected, not a fault, and is exactly why the two batches processed in Prod are a genuine end-to-end proof rather than a copy of Dev's results.
-- **Git integration and a branch policy give this a real audit trail.** A change reaches main only through a pull request, which is what "changes committed and synced from the Fabric UI" is meant to demonstrate, not just that Git is connected. It also means the workspace bound to main is a destination rather than a source: development happens in a feature workspace, and `aeropulse-dev` receives the merged result.
-- **A scoped RBAC grant on the Prod container**, rather than broad or inherited access, keeps the access control story consistent with the principle of least privilege, worth calling out explicitly rather than leaving implicit.
-
-
-
----
-
-# Stage 9: Data Warehouse and Analytics Objects
+<a id="8-warehouse-and-analytics"></a>
+<details>
+<summary><b>8. Warehouse and analytics</b></summary>
 
 ## What was built
 
@@ -284,103 +313,13 @@ Both are Stored procedure activities in the pipeline, with `batch_id` bound to t
 
 **Testing** covers row counts reconciled between Warehouse and Gold, orphaned surrogate key checks on carrier, origin airport and date, smoke tests on every view and function, and a cancellation consistency check confirming every cancelled flight carries a code and no uncancelled flight does.
 
-## Why
+![Warehouse objects](docs/images/08-warehouse-objects.png)
 
-**Answering questions, not exposing tables.** The four views exist because operations, commercial and network planning ask different questions on different cadences, and each needs a shaped answer rather than a fact table to work out for themselves. `vw_cancellation_analysis` is the clearest example: counting cancellations is easy and not very useful, whereas knowing that weather drives one carrier's cancellations while another's are carrier-caused is actionable.
+</details>
 
-**A view cannot answer an ad hoc question.** Views take no parameters, so "how did this carrier do between these two dates" has to be a stored procedure. Equally, a procedure's result set cannot be joined to, so anything a caller needs to filter further has to be an inline table-valued function. The object type follows from what each one can technically do:
-
-| | Parameters | Joinable | Can write |
-|---|---|---|---|
-| View | No | Yes | No |
-| Stored procedure | Yes | No | Yes |
-| Inline table-valued function | Yes | Yes | No |
-| Scalar function | Yes | In expressions | No |
-
-**Two schemas set up least privilege.** Splitting base tables from consumer-facing objects means the next stage can grant on `analytics` and deny on `dbo`, so consumers reach the data only through governed views and never the raw fact table. Object-level security falls out of the structure rather than being retrofitted onto a flat schema.
-
-**Explicit DDL protects the security model.** CTAS drops and recreates a table on every reload, taking any GRANT, RLS policy or masking rule with it. Defining tables once and reloading their contents means the security objects added in Stage 10 survive every refresh, which is why `cancellation_code` was added by ALTER rather than a rebuild.
-
-**Objects deploy, scripts do not.** Wrapping the load in a stored procedure rather than leaving it as a loose script means it promotes with the Warehouse through the deployment pipeline, so Prod executes it rather than someone pasting SQL into a second environment. The same applies to parameters: a procedure's parameters come from whatever calls it, which is what lets the orchestration pipeline drive the refresh per batch.
-
-**Business logic lives in one layer.** `delay_category`, `is_delayed` and `primary_delay_cause` are derived in the Gold notebook and deliberately not reimplemented here, because the same rule in two places eventually becomes two different rules. The scalar function adds something genuinely new instead, banding departure times, which answers whether delay compounds through the day, a question the model could not otherwise address.
-
-**Where logic sits depends on what it is.** `cancellation_code` is stored as the source records it and decoded in the view, because a four-value lookup on one column is presentation. `primary_delay_cause` is derived upstream because working it out means comparing five columns against each other, which is transformation.
-
-**Join keys are typed to match.** `flight_date_id` is built in Gold as an integer so it matches `dim_date.date_id`, avoiding an implicit conversion on every downstream query. It is a dimensional surrogate key, so building it in the dimensional layer rather than in Silver puts it where it belongs.
-
-**Reloads are idempotent.** The summary refresh clears a batch's rows before reinserting, so re-running it after a corrected batch replaces rather than duplicates. The Warehouse itself is a full reload of current Gold state, which rewrites more than strictly necessary each month but keeps the load logic simple and leaves incremental merge logic in the Lakehouse layer where it already exists. At this volume that trade is worth making.
-
----
-
-# Stage 9b: Promoting the Warehouse to Production
-
-## What was deployed
-
-The Warehouse was built in `aeropulse-dev` and promoted to `aeropulse-prod` through the existing `aeropulse-dev-to-prod` deployment pipeline, making it the first substantial piece of new work carried by that pipeline rather than an initial baseline copy.
-
-The release contained three items:
-
-| Item | State in the comparison view | Why it changed |
-|---|---|---|
-| `aeropulse_wh` | New | Never previously deployed |
-| Gold flight notebook | Different | Added `cancellation_code`, rebuilt `flight_date_id` as an integer |
-| Orchestration pipeline | Different | Added the Warehouse load and summary refresh activities |
-
-**What a Warehouse deployment carries, and what it does not:**
-
-| Carried across | Not carried across |
-|---|---|
-| Schemas (`dbo`, `analytics`) | Table data |
-| Table definitions | Saved query tabs in the SQL editor |
-| Views, functions, stored procedures | Anything authored outside the Warehouse item |
-
-Saved query tabs staying behind is correct rather than a gap. Prod is only ever changed by deployment, so build scripts sitting in the Prod editor would invite exactly the manual change the process is designed to prevent. The only SQL run directly in Prod is the load and refresh calls, and the verification queries.
-
-## How it was deployed
-
-**The Warehouse could not be promoted in a single pass**, because the release changed both a Gold table's schema and the Warehouse that reads it.
-
-When Fabric imports a Warehouse it recreates each object by executing its DDL. Creating `usp_load_warehouse_from_gold` therefore requires resolving every column the procedure references, including `aeropulse_gold_lh.dbo.fact_flight.cancellation_code`. Prod's Gold table existed but did not yet have that column, so the procedure failed to create and the import stopped:
-
-```
-DmsImportDatabaseException ... File: dbo/StoredProcedures/usp_load_warehouse_from_gold.sql,
-Error: Invalid column name 'cancellation_code'.
-```
-
-Deferred name resolution does not help here. It applies when a referenced table is missing entirely, not when the table resolves and one of its columns does not.
-
-The import also does not roll back cleanly. The first attempt left a partially built Warehouse in Prod with the `dbo` objects present and no `analytics` schema, which had to be deleted before a clean redeployment.
-
-**The sequence that worked:**
-
-1. **Deploy everything except the Warehouse.** Notebooks and the orchestration pipeline promoted first, with `aeropulse_wh` deselected.
-2. **Rebuild Prod's Gold** using the newly deployed notebook: drop `fact_flight`, re-run for both batches, and confirm `cancellation_code` is actually present before continuing. Deploying a notebook carries the code, not the data it produces, so this step is a genuine execution rather than a promotion.
-3. **Delete the partial Warehouse** left by the failed attempt.
-4. **Deploy the Warehouse.** The procedure body now resolves and the import completes.
-5. **Populate Prod:** `usp_load_warehouse_from_gold`, then `usp_refresh_monthly_summary` once per loaded batch.
-6. **Verify:** object catalogue checked against the expected set, row counts reconciled against Prod's own Gold, orphan key checks returning zero.
-
-**Verification found `dim_carrier` empty in Prod.** The Warehouse load is a straight mirror of Gold, so an empty target meant an empty source. The cause was upstream: airport and carrier are full-refresh reference sources that had deliberately been left outside the orchestration pipeline and run by hand instead. That worked in Dev, where they had been run, and failed silently in Prod, where they had not. The Gold reference notebooks compounded it by filtering their Silver source on `batch_id`, so a mismatch produced an empty dimension rather than an error.
-
-The fix was to bring the reference chain into the orchestration pipeline so it runs in every environment without depending on anyone remembering.
-
-## Why
-
-**Deployment moves item definitions, not data, and that is the point.** Prod's Warehouse arrived with its full object set and no rows, exactly as Prod's lakehouses did earlier. Each environment then proves itself by loading and running independently, so a green Prod is evidence the solution works there rather than a copy of Dev's results.
-
-**Object dependencies across items create deployment ordering constraints.** A Warehouse procedure that reads a Lakehouse table binds the two items together at deployment time, not just at runtime. Any release that changes a schema on one side and the reader on the other has to be sequenced, which is a normal release-management problem rather than a Fabric quirk, and is why the promotion process is written down rather than improvised.
-
-**Manual steps do not survive promotion.** The empty `dim_carrier` is the clearest evidence in this project for automating everything a pipeline can reasonably own. A step that exists only as something a person remembers to do will hold in the environment where it was done and quietly fail everywhere else. The reference data was small enough that keeping it out of the pipeline saved very little, and the cost of that saving was an entire dimension missing in Production.
-
-**Failures should be loud.** The reference dimension failed silently because a `batch_id` filter on a full-refresh table returns an empty set rather than an error when nothing matches. Removing that filter turns a class of silent emptiness into either correct data or a visible failure, which is the more useful of the two outcomes.
-
-**Production is a destination, never a source.** No object in the Prod Warehouse was created by hand. Everything arrived by deployment, and the only statements executed there are the load, the refresh and the verification queries. That is what makes the Dev to Prod comparison meaningful: the code is identical and only the environment bindings and the data differ.
-
----
-
-# Stage 10: Security and Access Control
-
+<a id="9-security"></a>
+<details>
+<summary><b>9. Security & Access Management</b></summary>
 ## What was built
 
 Two test identities in Microsoft Entra ID, created with no directory role and no Azure RBAC, so that every permission they hold is one granted deliberately in Fabric or in T-SQL:
@@ -510,17 +449,152 @@ REVOKE UNMASK ON <schema>.<table> TO [user];
 
 **Governance sits alongside access, not inside it.** Endorsement (promoted, certified, master data), tagging and sensitivity labels do not grant or restrict access. They tell people what an item is and how far it can be trusted, which is a different problem from who may read it. Certification is restricted to reviewers a Fabric administrator nominates, precisely so that "certified" keeps meaning something.
 
+![Row level security](docs/images/09-rls-test.png)
+![Dynamic data masking](docs/images/09-masking-test.png)
 
+</details>
 
+---
 
+## Two things that went wrong
 
+These are the parts I would want to talk through in an interview.
 
+### The Warehouse would not deploy
 
+Promoting the Warehouse to Prod failed on import:
 
+```
+DmsImportDatabaseException ... File: dbo/StoredProcedures/usp_load_warehouse_from_gold.sql,
+Error: Invalid column name 'cancellation_code'.
+```
 
+Fabric recreates each Warehouse object by executing its DDL. Creating the load procedure meant resolving every column it references, including one in the Gold lakehouse. Prod's Gold table existed but did not yet have `cancellation_code`, because the same release added the column upstream. Deferred name resolution does not save you here: it covers a missing table, not a missing column on a table that resolves.
 
+The import also does not roll back cleanly. It left a half-built Warehouse in Prod with `dbo` present and no `analytics` schema, which had to be deleted before retrying.
 
+The fix was to sequence the release: deploy the notebooks first, rebuild Prod's Gold using them, delete the partial Warehouse, then deploy the Warehouse. The lesson is that a Warehouse procedure reading a Lakehouse table binds those two items together at deployment time, not just at runtime. Any release touching both sides of that boundary needs ordering, which is ordinary release management rather than a Fabric quirk.
 
+### An entire dimension was empty in Production
 
+Verification found `dim_carrier` empty in Prod. The Warehouse load mirrors Gold, so an empty target meant an empty source.
 
+The cause was upstream. Airport and carrier are full-refresh reference sources, and I had deliberately left them outside the orchestration pipeline to run by hand. That worked in Dev, where I had run them. It failed in Prod, where I had not. Worse, the Gold reference notebooks filtered their Silver source on `batch_id`, so the mismatch produced an empty dimension rather than an error.
+
+Two things came out of this. Any step that exists only as something a person remembers to do will hold in the environment where it was done and quietly fail everywhere else, and the saving from keeping those small tables out of the pipeline was not worth a missing dimension in Production. And a `batch_id` filter on a full-refresh table returns an empty set rather than an error, which turns a bug into silence. Removing the filter converts that into either correct data or a visible failure, and a visible failure is the more useful of the two.
+
+---
+
+## Decisions worth explaining
+
+**Configuration lives apart from logic.** Paths and account names sit in one shared notebook per layer, so an environment change is one edit rather than a find and replace across the codebase.
+
+**One write function per layer.** Three near-identical copies become three places to fix the same bug. The helper notebooks exist so that every source behaves consistently and improvements only need making once.
+
+**Landing stays raw.** No cleaning, no casting. If a transformation rule turns out to be wrong six months later, the original is still there to replay.
+
+**Fail at the door.** Explicit schemas with `FAILFAST` in Bronze mean a bad row is rejected on entry rather than quietly corrupting a dimension three layers down.
+
+**Re-running a batch is safe.** `replaceWhere` on a partitioned `batch_id` in Bronze, a batch-guarded merge in Silver, and a clear-then-insert in the Warehouse summary. Nothing in the chain duplicates or clobbers on a second run.
+
+**Flag data quality problems, do not drop them.** A dropped row is an invisible problem. A flagged row is a decision someone can make.
+
+**Derive business logic once.** `is_delayed` uses the standard 15 minute BTS definition and is computed in Gold, not reimplemented in DAX or in each view. The same rule in two places eventually becomes two different rules.
+
+**Put logic where it belongs.** `primary_delay_cause` compares five columns against each other, so it is transformation and belongs upstream. `cancellation_code` is a four-value lookup on one column, so it is presentation and gets decoded in the view.
+
+**Grant upwards rather than deny downwards.** Share an item with nothing attached, then grant specific access. Starting broad and carving exceptions with `DENY` gets harder to audit with every exception.
+
+**Masking is not a security boundary.** It prevents accidental exposure. It does not stop determined access, and a privileged workspace role sees straight through it. It belongs on top of object, column and row security, never instead of them.
+
+**Production is a destination, never a source.** No object in the Prod Warehouse was created by hand. Everything arrived by deployment, and the only SQL run there is the load, the refresh and the verification queries.
+
+---
+
+## Repository layout
+
+```
+notebooks/
+  landing/          config, helper, three ingestion notebooks
+  bronze/           config, helper, three landing to bronze notebooks
+  silver/           config, helper, profiling, three bronze to silver notebooks
+  gold/             config, helper, four dimensions, one fact
+  control/          control table plus four state transition notebooks
+warehouse/
+  01_create_schema_and_tables.sql
+  02_create_and_load_stored_proc.sql
+  03_create_functions.sql
+  04_create_views.sql
+  05_create_summary_table_and_refresh.sql
+  06_create_reporting_stored_proc.sql
+  security/         object, column and row level security, masking
+  tests/            reconciliation and validation queries
+docs/
+  images/           screenshots and diagrams
+  data-dictionary.md
+```
+
+Warehouse scripts are numbered by run order. Functions have to exist before the views and procedures that call them.
+
+---
+
+## Screenshots
+
+<details>
+<summary><b>Environment and ingestion</b></summary>
+
+![Entra user](docs/images/gallery/01-entra-user.png)
+![Fabric capacity](docs/images/gallery/01-capacity.png)
+![ADLS container](docs/images/gallery/02-adls-container.png)
+![Landing output](docs/images/gallery/02-landing-output.png)
+
+</details>
+
+<details>
+<summary><b>Transformation</b></summary>
+
+![Bronze schema enforcement](docs/images/gallery/03-bronze-schema.png)
+![Silver quality flags](docs/images/gallery/04-silver-flags.png)
+![Gold dimensions](docs/images/gallery/05-gold-dims.png)
+![Fact table](docs/images/gallery/05-fact-flight.png)
+
+</details>
+
+<details>
+<summary><b>Orchestration and monitoring</b></summary>
+
+![Pipeline success run](docs/images/gallery/06-pipeline-success.png)
+![Pipeline failure path](docs/images/gallery/06-pipeline-failure.png)
+![Monitoring hub](docs/images/gallery/06-monitoring-hub.png)
+![Data Activator alert](docs/images/gallery/06-alert.png)
+
+</details>
+
+<details>
+<summary><b>CI/CD</b></summary>
+
+![Pull request](docs/images/gallery/07-pull-request.png)
+![Commit rejected by policy](docs/images/gallery/07-commit-rejected.png)
+![Deployment comparison](docs/images/gallery/07-deploy-compare.png)
+![Deployment rules](docs/images/gallery/07-deploy-rules.png)
+
+</details>
+
+<details>
+<summary><b>Warehouse and security</b></summary>
+
+![Analytics views](docs/images/gallery/08-views.png)
+![Reconciliation tests](docs/images/gallery/08-tests.png)
+![Column level security denial](docs/images/gallery/09-cls-denied.png)
+![Masked output as test user](docs/images/gallery/09-masked-output.png)
+
+</details>
+
+---
+
+## Project 1
+
+[Aeropulse: ADLS to Gold](#) builds the foundation this repository extends: one Fabric workspace, the medallion architecture, and the dimensional model.
+
+Together the two cover DP-700 Domain 1 (Implement and Manage an Analytics Solution) and Domain 3 (Monitor and Optimize).
 
