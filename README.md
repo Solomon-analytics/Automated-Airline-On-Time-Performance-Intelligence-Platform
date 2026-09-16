@@ -25,6 +25,7 @@ This repository is the second of two projects. [Project 1](#project-1) built a w
   - [7. CI/CD and Deployment Pipeline](#7-cicd)
   - [8. Warehouse and analytics](#8-warehouse-and-analytics)
   - [9. Security & Access Management](#9-security)
+  - [10. Reconciliation tests and promotion](#10-reconciliation-tests-and-promotion
 - [Two things that went wrong](#two-things-that-went-wrong)
 - [Decisions worth explaining](#decisions-worth-explaining)
 - [Repository layout](#repository-layout)
@@ -453,6 +454,87 @@ REVOKE UNMASK ON <schema>.<table> TO [user];
 ![Dynamic data masking](docs/images/09-masking-test.png)
 
 </details>
+
+<a id="10-reconciliation-tests-and-promotion"></a>
+<details>
+<summary><b>10. Reconciliation tests and promotion</b></summary>
+
+A single PySpark notebook, `reconciliation-validation-tests`, checks one run end to end
+across landing, bronze, silver and gold. Built and proven in `aeropulse-dev`, committed
+through Azure DevOps, then promoted to `aeropulse-prod` by the deployment pipeline.
+
+### What it checks
+
+Counts do not reconcile the same way at every hop, and pretending they do is how a test
+ends up agreeing with whatever the data happens to be.
+
+| Hop | Expected | Why |
+|---|---|---|
+| Landing to bronze | Exactly equal | Bronze does no filtering or dedup. `FAILFAST` either passed everything or threw |
+| Bronze to silver | Silver equals the distinct non-null grain in bronze | Silver dedupes and drops null keys, so it can only shrink, and by a knowable amount |
+| Silver to gold | Exactly equal | The dimension joins should not drop facts |
+
+That middle one is the one usually fudged as "silver is smaller, looks about right". The
+shrinkage is calculable, so it is checked exactly.
+
+On top of the row counts: surrogate key uniqueness, referential integrity from the fact
+to every dimension, date keys resolving against the generated calendar, lineage columns
+surviving into bronze, and every batch appearing in every layer.
+
+Two checks earn their place beyond the obvious. **Dimensions are not empty**, which is
+the check that would have caught the empty `dim_carrier` that reached Production earlier
+in this project. And **derived rules still agree with the data they came from**, testing
+`is_delayed` against the 15 minute arrival delay rule it was built from. Row counts and
+key integrity both pass happily while business logic has quietly drifted.
+
+![Reconciliation test run](docs/images/10-reconciliation-test-run.png)
+
+### It has to fail loudly
+
+A failed check raises, which fails the notebook. A test that only writes results
+somewhere needs a person to go and look, and nobody does. The point is that a data
+correctness problem stops the run the same way a technical exception does.
+
+### One change before it could be promoted
+
+The notebook resolves its OneLake paths from a single `WORKSPACE` constant. Left as an
+ordinary variable it would have travelled to Production still pointing at Dev, passed
+every check against Dev data, and reported green.
+
+Fabric deployment rules can rebind a default lakehouse and can override a parameter cell
+variable. They cannot touch an arbitrary constant sitting in a normal code cell. So
+`WORKSPACE` moved into a parameter cell with a deployment rule on the Production stage,
+the same pattern already used for the ADLS container in Stage 7. There is also an assert
+that all four layer paths sit in the same workspace, so a half-edited config fails
+immediately rather than silently comparing Dev against Prod.
+
+### Committing through Azure DevOps
+
+The workspace is bound to `main`, which has a branch policy requiring a reviewer, so a
+direct commit is rejected. Changes go out on a feature branch, through a pull request,
+get approved, and merge to `main`. The workspace then updates from source control.
+
+Two items in this change: the new notebook, and the warehouse it sits alongside.
+
+![Commit and approval in Azure DevOps](docs/images/devops-CICD-commit.png)
+
+### Deploying to Production
+
+The deployment pipeline compares the two stages and shows the notebook as **Only in
+source**, since Prod has never seen it. Deploying carries the item definition across.
+
+Unlike the warehouse promotion in Stage 8b, this one needed no sequencing. The notebook
+reads Delta paths at runtime rather than resolving columns at import time, so nothing
+binds to another item during deployment and it goes over in a single pass.
+
+![Deploying from dev to prod](docs/images/deploying-changes-from-dev-to-prod.png)
+
+Prod then runs the tests against its own batches. That matters: the checks compare layers
+within one workspace, so a green run in Prod is evidence the solution works there rather
+than a copy of Dev's result.
+
+</details>
+
 
 ---
 
